@@ -3,7 +3,9 @@ import joblib
 import numpy as np
 import sqlite3
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
+import random
+import matplotlib.pyplot as plt
 
 # --- Database setup ---
 def init_db():
@@ -20,24 +22,27 @@ def init_db():
             windspeed REAL,
             hour INTEGER,
             month INTEGER,
-            prediction REAL
+            prediction REAL,
+            bron TEXT
         )
     ''')
     conn.commit()
     conn.close()
 
-def save_prediction(inputs, prediction):
+def save_prediction(inputs, prediction, bron='handmatig', timestamp=None):
+    if timestamp is None:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     conn = sqlite3.connect('predictions.db')
     c = conn.cursor()
     c.execute('''
         INSERT INTO predictions (timestamp, lights, tdewpoint, rh_6, day_of_week, 
-                                  windspeed, hour, month, prediction)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  windspeed, hour, month, prediction, bron)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
-        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        timestamp,
         inputs[0], inputs[1], inputs[2], inputs[3],
         inputs[4], inputs[5], inputs[6],
-        prediction
+        prediction, bron
     ))
     conn.commit()
     conn.close()
@@ -82,7 +87,6 @@ with tab1:
         input_data = np.array([input_values])
         prediction = model.predict(input_data)[0]
         
-        # Opslaan in database
         save_prediction(input_values, prediction)
         
         st.success(f'Voorspeld energieverbruik: {prediction:.2f} Wh')
@@ -97,45 +101,72 @@ with tab2:
     if len(history) == 0:
         st.write('Nog geen voorspellingen opgeslagen.')
     else:
-        st.dataframe(history, use_container_width=True)
-        
-        # Grafiek: voorspellingen over tijd
-        st.subheader('Voorspellingen over tijd')
         history['timestamp'] = pd.to_datetime(history['timestamp'])
         
-        st.line_chart(data=history, x='timestamp', y='prediction')
+        # Datumfilter
+        st.subheader('Filter op periode')
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input('Van', value=history['timestamp'].min().date())
+        with col2:
+            end_date = st.date_input('Tot', value=history['timestamp'].max().date())
         
-        st.write(f'Totaal aantal voorspellingen: {len(history)}')
+        # Filteren
+        filtered = history[
+            (history['timestamp'].dt.date >= start_date) & 
+            (history['timestamp'].dt.date <= end_date)
+        ]
+        
+        # Tabel
+        st.dataframe(filtered, use_container_width=True)
+        
+        # Grafiek: gemiddelde voorspelling per dag als lijnplot
+        st.subheader('Voorspellingen over tijd')
+        
+        filtered['datum'] = filtered['timestamp'].dt.date
+        
+        fig, ax = plt.subplots(figsize=(10, 4))
+        
+        for bron, kleur in [('handmatig', 'steelblue'), ('synthetisch', 'orange')]:
+            data = filtered[filtered['bron'] == bron]
+            if len(data) > 0:
+                daggemiddelde = data.groupby('datum')['prediction'].mean()
+                ax.plot(daggemiddelde.index, daggemiddelde.values, 
+                       color=kleur, label=f'{bron} (daggemiddelde)', marker='o', markersize=4)
+        
+        ax.set_xlabel('Datum')
+        ax.set_ylabel('Gemiddelde voorspelling (Wh)')
+        ax.set_title(f'Daggemiddelde voorspellingen van {start_date} tot {end_date}')
+        ax.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig)
+        
+        # Telling
+        st.write(f'Voorspellingen in deze periode: {len(filtered)}')
+        st.write(f'  Handmatig: {len(filtered[filtered["bron"] == "handmatig"])}')
+        st.write(f'  Synthetisch: {len(filtered[filtered["bron"] == "synthetisch"])}')
 
 # --- Tab 3: Simulatie met synthetische data ---
 with tab3:
     st.header('Simulatie met synthetische data')
-    st.write('Laad de synthetische dataset en simuleer voorspellingen om app-gebruik na te bootsen.')
+    st.write('Laad de synthetische dataset en simuleer voorspellingen over de afgelopen 30 dagen.')
     
     if st.button('Start simulatie'):
         synthetic = pd.read_csv('data/synthetic_data.csv')
-        
         predictions = model.predict(synthetic[features])
         
-        # Elke voorspelling opslaan in de database
-        conn = sqlite3.connect('predictions.db')
-        c = conn.cursor()
+        now = datetime.now()
+        start = now - timedelta(days=30)
         
         for i in range(len(synthetic)):
             row = synthetic.iloc[i]
-            c.execute('''
-                INSERT INTO predictions (timestamp, lights, tdewpoint, rh_6, day_of_week, 
-                                          windspeed, hour, month, prediction)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                row['lights'], row['Tdewpoint'], row['RH_6'], row['day_of_week'],
-                row['Windspeed'], row['hour'], row['month'],
-                predictions[i]
-            ))
+            random_time = start + timedelta(seconds=random.randint(0, 30 * 24 * 3600))
+            
+            input_values = [row['lights'], row['Tdewpoint'], row['RH_6'], row['day_of_week'],
+                           row['Windspeed'], row['hour'], row['month']]
+            save_prediction(input_values, predictions[i], bron='synthetisch',
+                          timestamp=random_time.strftime('%Y-%m-%d %H:%M:%S'))
         
-        conn.commit()
-        conn.close()
-        
-        st.success(f'{len(synthetic)} voorspellingen gesimuleerd en opgeslagen!')
+        st.success(f'{len(synthetic)} voorspellingen gesimuleerd over de afgelopen 30 dagen!')
         st.write('Ga naar het tabblad "Voorspelgeschiedenis" om de resultaten te bekijken.')
